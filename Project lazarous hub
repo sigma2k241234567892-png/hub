@@ -860,54 +860,8 @@ headerBlend.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
 headerBlend.BorderSizePixel = 0
 headerBlend.Parent = Header
 
-local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, -55, 1, 0)
-Title.Position = UDim2.new(0, 15, 0, 0)
-Title.BackgroundTransparency = 1
-Title.Text = "PROJECT LAZARUS HUB â V3.5"
-Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-Title.Font = Enum.Font.GothamBold
-Title.TextSize = 12
-Title.TextXAlignment = Enum.TextXAlignment.Left
-Title.Parent = Header
-
-local Subtitle = Instance.new("TextLabel")
-Subtitle.Size = UDim2.new(0, 1, 0, 1)
-Subtitle.Position = UDim2.new(0, 0, 0, 0)
-Subtitle.BackgroundTransparency = 1
-Subtitle.Text = "Tap the floating icon to open/close"
-Subtitle.TextColor3 = Config.EspColor
-Subtitle.Font = Enum.Font.GothamSemibold
-Subtitle.TextSize = 11
-Subtitle.TextXAlignment = Enum.TextXAlignment.Right
-Subtitle.Parent = Header
-
--- Close Button
-local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size = UDim2.new(0, 30, 0, 30)
-CloseBtn.Position = UDim2.new(1, -40, 0.5, -15)
-CloseBtn.BackgroundTransparency = 1
-CloseBtn.Text = "â"
-CloseBtn.TextColor3 = Color3.fromRGB(150, 150, 150)
-CloseBtn.Font = Enum.Font.GothamBold
-CloseBtn.TextSize = 16
-CloseBtn.Parent = Header
-
-CloseBtn.MouseButton1Click:Connect(function()
-    toggleNoclip(false)
-    local baddies = workspace:FindFirstChild("Baddies")
-    if baddies then
-        for _, zombie in ipairs(baddies:GetChildren()) do
-            removeESP(zombie)
-        end
-    end
-    ScreenGui:Destroy()
-    _G.LazarusHubLoaded = nil
-end)
-CloseBtn.MouseEnter:Connect(function() CloseBtn.TextColor3 = Color3.fromRGB(255, 70, 70) end)
-CloseBtn.MouseLeave:Connect(function() CloseBtn.TextColor3 = Color3.fromRGB(150, 150, 150) end)
-
--- Floating mobile button: always available while the menu is hidden.
+-- Floating mobile button: draggable and always available while the menu is hidden.
+local UserInputService = game:GetService("UserInputService")
 local MobileToggle = Instance.new("TextButton")
 MobileToggle.Name = "MobileMenuToggle"
 MobileToggle.Size = UDim2.new(0, 54, 0, 54)
@@ -929,12 +883,64 @@ local mobileToggleStroke = Instance.new("UIStroke")
 mobileToggleStroke.Color = Config.EspColor
 mobileToggleStroke.Thickness = 2
 mobileToggleStroke.Parent = MobileToggle
-MobileToggle.Activated:Connect(function()
-    MainFrame.Visible = not MainFrame.Visible
-    MobileToggle.Text = MainFrame.Visible and "Ã" or "PL"
+
+-- Drag support for touchscreens and mouse. A drag won't accidentally toggle the menu.
+local draggingToggle = false
+local dragInput = nil
+local dragStart = nil
+local startPosition = nil
+local dragMoved = false
+local DRAG_THRESHOLD = 8
+
+MobileToggle.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        draggingToggle = true
+        dragMoved = false
+        dragStart = input.Position
+        startPosition = MobileToggle.Position
+        dragInput = input
+    end
 end)
 
+MobileToggle.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragInput = input
+    end
+end)
 
+UserInputService.InputChanged:Connect(function(input)
+    if draggingToggle and dragStart and startPosition and
+        (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+        local delta = input.Position - dragStart
+        if math.abs(delta.X) > DRAG_THRESHOLD or math.abs(delta.Y) > DRAG_THRESHOLD then
+            dragMoved = true
+        end
+        MobileToggle.Position = UDim2.new(
+            startPosition.X.Scale, startPosition.X.Offset + delta.X,
+            startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+        )
+    end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if draggingToggle then
+            draggingToggle = false
+            dragInput = nil
+            dragStart = nil
+            startPosition = nil
+        end
+    end
+end)
+
+MobileToggle.Activated:Connect(function()
+    if dragMoved then
+        dragMoved = false
+        return
+    end
+    MainFrame.Visible = not MainFrame.Visible
+    MobileToggle.Text = MainFrame.Visible and "PL" or "PL"
+end)
 
 -- Sidebar (Left side navigation)
 local Sidebar = Instance.new("Frame")
@@ -1564,4 +1570,4 @@ local noclipRow = createToggleRow(playerPage, "Noclip (Wall Hack)", Config.Nocli
 end)
 
 showToast("[HUB] Mobile UI loaded.", 4)
-print("[HUB] Lazarus Mobile Hub loaded.")
+print("[HUB] Lazarus Mobile Hub loaded.")ẻ
