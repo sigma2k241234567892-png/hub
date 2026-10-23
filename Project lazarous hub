@@ -8,13 +8,29 @@ local LocalPlayer = Players.LocalPlayer
 -- Reset load check
 _G.LazarusHubLoaded = nil
 
--- Clean up any existing GUI/HUD
-local oldGui = game.CoreGui:FindFirstChild("LazarusHubV3") or game.CoreGui:FindFirstChild("LazarusHub")
-if oldGui then pcall(function() oldGui:Destroy() end) end
-local oldHud = game.CoreGui:FindFirstChild("LazarusKeybindHUD")
-if oldHud then pcall(function() oldHud:Destroy() end) end
+-- Choose a GUI parent supported by the current executor (Delta may expose gethui).
+local GuiParent
+pcall(function()
+    if typeof(gethui) == "function" then
+        GuiParent = gethui()
+    end
+end)
+if not GuiParent then
+    pcall(function() GuiParent = game:GetService("CoreGui") end)
+end
+if not GuiParent then
+    pcall(function() GuiParent = Players.LocalPlayer:WaitForChild("PlayerGui") end)
+end
 
-_G.LazarusHubLoaded = true
+-- Clean up previous copies without allowing a CoreGui access error to stop startup.
+if GuiParent then
+    for _, guiName in ipairs({"LazarusHubV3", "LazarusHub", "LazarusKeybindHUD"}) do
+        pcall(function()
+            local oldGui = GuiParent:FindFirstChild(guiName)
+            if oldGui then oldGui:Destroy() end
+        end)
+    end
+end
 
 ----------------------------------------------------------------
 -- CONFIGURATION & BINDS STATE
@@ -63,8 +79,10 @@ local ammoUpvalues = {} -- holds list of {func, index} for active ammo variables
 ----------------------------------------------------------------
 -- 1. METAMETHOD HOOKS (BYPASS SPEED/JUMP RESET & ANTI-CHEAT)
 ----------------------------------------------------------------
-local SendData = ReplicatedStorage:WaitForChild("ClientRemotes"):WaitForChild("SendData")
-local UpdateDamageKey = ReplicatedStorage:WaitForChild("UpdateDamageKey")
+-- Use non-blocking lookups: missing remotes must not prevent the UI from loading.
+local clientRemotes = ReplicatedStorage:FindFirstChild("ClientRemotes")
+local SendData = clientRemotes and clientRemotes:FindFirstChild("SendData") or nil
+local UpdateDamageKey = ReplicatedStorage:FindFirstChild("UpdateDamageKey")
 
 local originalStats = {}
 local damageKey = nil
@@ -105,38 +123,54 @@ local function cacheWeapon(wp)
     end
 end
 
-for _, item in ipairs(LocalPlayer.Backpack:GetChildren()) do cacheWeapon(item) end
+local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+if backpack then
+    for _, item in ipairs(backpack:GetChildren()) do cacheWeapon(item) end
+end
 if LocalPlayer.Character then
     for _, item in ipairs(LocalPlayer.Character:GetChildren()) do cacheWeapon(item) end
 end
 
--- Hook UpdateDamageKey to capture the security key
+-- Executor-specific hooks are optional. If Delta does not expose one of them,
+-- continue to the UI instead of aborting the entire script before it appears.
+local canHookFunction = type(hookfunction) == "function"
+local canHookMeta = type(hookmetamethod) == "function"
+local wrapClosure = type(newcclosure) == "function" and newcclosure or function(fn) return fn end
 local oldInvokeServer
-oldInvokeServer = hookfunction(UpdateDamageKey.InvokeServer, newcclosure(function(self, ...)
-    local args = {...}
-    damageKey = args[1]
-    print("[BYPASS] Captured Damage Key:", damageKey)
-    return oldInvokeServer(self, ...)
-end))
+if canHookFunction and UpdateDamageKey and UpdateDamageKey:IsA("RemoteFunction") then
+    pcall(function()
+        oldInvokeServer = hookfunction(UpdateDamageKey.InvokeServer, wrapClosure(function(self, ...)
+            local args = {...}
+            damageKey = args[1]
+            return oldInvokeServer(self, ...)
+        end))
+    end)
+end
 
--- NewIndex Metamethod Hook for Bypassing WalkSpeed/JumpPower resets & spoofing values
+-- NewIndex hook is installed only when the executor exposes the required APIs.
 local oldNewIndex
-oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(self, idx, val)
-    if not checkcaller() and self:IsA("Humanoid") then
-        if idx == "WalkSpeed" and Config.SpeedHackEnabled then
-            return oldNewIndex(self, idx, Config.WalkSpeedValue)
-        elseif idx == "JumpPower" and Config.JumpHackEnabled then
-            return oldNewIndex(self, idx, Config.JumpPowerValue)
-        elseif idx == "JumpHeight" and Config.JumpHackEnabled then
-            return oldNewIndex(self, idx, Config.JumpPowerValue / 7.84)
-        end
-    end
-    return oldNewIndex(self, idx, val)
-end))
+if canHookMeta and type(checkcaller) == "function" then
+    pcall(function()
+        oldNewIndex = hookmetamethod(game, "__newindex", wrapClosure(function(self, idx, val)
+            if not checkcaller() and self:IsA("Humanoid") then
+                if idx == "WalkSpeed" and Config.SpeedHackEnabled then
+                    return oldNewIndex(self, idx, Config.WalkSpeedValue)
+                elseif idx == "JumpPower" and Config.JumpHackEnabled then
+                    return oldNewIndex(self, idx, Config.JumpPowerValue)
+                elseif idx == "JumpHeight" and Config.JumpHackEnabled then
+                    return oldNewIndex(self, idx, Config.JumpPowerValue / 7.84)
+                end
+            end
+            return oldNewIndex(self, idx, val)
+        end))
+    end)
+end
 
--- Hook Namecall to block anti-cheat checks & spoof weapon data
+-- Namecall hook is optional and guarded for executors with partial API support.
 local oldNamecall
-oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+if canHookMeta and type(getnamecallmethod) == "function" then
+    pcall(function()
+        oldNamecall = hookmetamethod(game, "__namecall", wrapClosure(function(self, ...)
     local method = getnamecallmethod()
     local args = {...}
     
@@ -179,15 +213,19 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
         end
     end
     
-    return oldNamecall(self, ...)
-end))
+            return oldNamecall(self, ...)
+        end))
+    end)
+end
 
 -- Function to search GC for existing damage key
 local function getDamageKeyFromGC()
-    if not getgc then return end
+    if type(getgc) ~= "function" or type(debug) ~= "table" then return end
     local getinfo = debug.getinfo or getinfo
-    if not getinfo then return end
-    for _, f in ipairs(getgc()) do
+    if type(getinfo) ~= "function" then return end
+    local gcOk, gcItems = pcall(getgc)
+    if not gcOk or type(gcItems) ~= "table" then return end
+    for _, f in ipairs(gcItems) do
         if type(f) == "function" then
             local infoOk, info = pcall(getinfo, f)
             if infoOk and info and info.source and info.source:find("WeaponScript") then
@@ -763,7 +801,20 @@ end
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "LazarusHubV3"
 ScreenGui.ResetOnSpawn = false
-ScreenGui.Parent = game.CoreGui
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999
+local guiParented = pcall(function()
+    ScreenGui.Parent = GuiParent
+end)
+if not guiParented or not ScreenGui.Parent then
+    pcall(function()
+        ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end)
+end
+if not ScreenGui.Parent then
+    warn("[Lazarus Mobile Hub] Unable to parent ScreenGui; GUI permissions are unavailable.")
+    return
+end
 
 -- Toast Notification Helper
 local function showToast(text, duration)
@@ -1570,4 +1621,4 @@ local noclipRow = createToggleRow(playerPage, "Noclip (Wall Hack)", Config.Nocli
 end)
 
 showToast("[HUB] Mobile UI loaded.", 4)
-print("[HUB] Lazarus Mobile Hub loaded.")ẻ
+print("[HUB] Lazarus Mobile Hub loaded.")
