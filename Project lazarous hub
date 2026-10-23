@@ -1,0 +1,1567 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+
+-- Reset load check
+_G.LazarusHubLoaded = nil
+
+-- Clean up any existing GUI/HUD
+local oldGui = game.CoreGui:FindFirstChild("LazarusHubV3") or game.CoreGui:FindFirstChild("LazarusHub")
+if oldGui then pcall(function() oldGui:Destroy() end) end
+local oldHud = game.CoreGui:FindFirstChild("LazarusKeybindHUD")
+if oldHud then pcall(function() oldHud:Destroy() end) end
+
+_G.LazarusHubLoaded = true
+
+----------------------------------------------------------------
+-- CONFIGURATION & BINDS STATE
+----------------------------------------------------------------
+local Config = {
+    -- Weapon Mods
+    WeaponModsEnabled = false,
+    InfiniteAmmo = false,
+    AlwaysAuto = false,
+    NoRecoil = false,
+    NoSpread = false,
+    NoSway = false,
+    InstantReload = false,
+    InfPenetration = false,
+    RapidFire = false,
+    RapidFireVal = 0.08,
+    DamageMode = "Normal",
+    CustomDamageVal = 100,
+
+    -- Visuals
+    EspEnabled = false,
+    EspBoxes = true,
+    EspNames = false,
+    EspHealth = false,
+    EspDistance = false,
+    EspColor = Color3.fromRGB(0, 180, 255),
+
+    -- Combat
+    KillAllActive = false,
+    AutoKillDelay = 0.2,
+    
+    -- Player
+    SpeedHackEnabled = false,
+    WalkSpeedValue = 45,
+    JumpHackEnabled = false,
+    JumpPowerValue = 70,
+    InfJumpEnabled = false,
+    NoclipEnabled = false
+}
+
+
+-- Caches to avoid scanning garbage collector every frame
+local activeWeaponTable = nil
+local ammoUpvalues = {} -- holds list of {func, index} for active ammo variables
+
+----------------------------------------------------------------
+-- 1. METAMETHOD HOOKS (BYPASS SPEED/JUMP RESET & ANTI-CHEAT)
+----------------------------------------------------------------
+local SendData = ReplicatedStorage:WaitForChild("ClientRemotes"):WaitForChild("SendData")
+local UpdateDamageKey = ReplicatedStorage:WaitForChild("UpdateDamageKey")
+
+local originalStats = {}
+local damageKey = nil
+
+-- Cache original weapon stats
+local function cacheWeapon(wp)
+    if wp:IsA("ModuleScript") and wp.Name:sub(1,6) == "Weapon" then
+        local ok, data = pcall(require, wp)
+        if ok and data then
+            local wIndex = wp.Name
+            if not originalStats[wIndex] then
+                originalStats[wIndex] = {
+                    WeaponName = data.WeaponName or "Beretta M9",
+                    Ammo = data.Ammo or 8,
+                    StoredAmmo = data.StoredAmmo or 32,
+                    MagSize = data.MagSize or 8,
+                    MaxAmmo = data.MaxAmmo or 32,
+                    DamageMax = data.Damage and data.Damage.Max or 20,
+                    DamageMin = data.Damage and data.Damage.Min or 20,
+                    FireTime = data.FireTime or 0.1,
+                    Semi = (data.Semi ~= nil) and data.Semi or true,
+                    ReloadTime = data.ReloadTime or 1.8,
+                    Penetration = data.Penetration or 1,
+                    GunKick = data.GunKick or 0.05,
+                    Sway = data.Sway or 0.01,
+                    Spread = data.Spread and {
+                        Min = data.Spread.Min or 0,
+                        Max = data.Spread.Max or 0,
+                        Movement = data.Spread.Movement or 0
+                    } or {Min = 0, Max = 0, Movement = 0},
+                    ViewKick = data.ViewKick and {
+                        Pitch = data.ViewKick.Pitch and {Min = data.ViewKick.Pitch.Min or 0, Max = data.ViewKick.Pitch.Max or 0} or {Min = 0, Max = 0},
+                        Yaw = data.ViewKick.Yaw and {Min = data.ViewKick.Yaw.Min or 0, Max = data.ViewKick.Yaw.Max or 0} or {Min = 0, Max = 0}
+                    } or nil
+                }
+            end
+        end
+    end
+end
+
+for _, item in ipairs(LocalPlayer.Backpack:GetChildren()) do cacheWeapon(item) end
+if LocalPlayer.Character then
+    for _, item in ipairs(LocalPlayer.Character:GetChildren()) do cacheWeapon(item) end
+end
+
+-- Hook UpdateDamageKey to capture the security key
+local oldInvokeServer
+oldInvokeServer = hookfunction(UpdateDamageKey.InvokeServer, newcclosure(function(self, ...)
+    local args = {...}
+    damageKey = args[1]
+    print("[BYPASS] Captured Damage Key:", damageKey)
+    return oldInvokeServer(self, ...)
+end))
+
+-- NewIndex Metamethod Hook for Bypassing WalkSpeed/JumpPower resets & spoofing values
+local oldNewIndex
+oldNewIndex = hookmetamethod(game, "__newindex", newcclosure(function(self, idx, val)
+    if not checkcaller() and self:IsA("Humanoid") then
+        if idx == "WalkSpeed" and Config.SpeedHackEnabled then
+            return oldNewIndex(self, idx, Config.WalkSpeedValue)
+        elseif idx == "JumpPower" and Config.JumpHackEnabled then
+            return oldNewIndex(self, idx, Config.JumpPowerValue)
+        elseif idx == "JumpHeight" and Config.JumpHackEnabled then
+            return oldNewIndex(self, idx, Config.JumpPowerValue / 7.84)
+        end
+    end
+    return oldNewIndex(self, idx, val)
+end))
+
+-- Hook Namecall to block anti-cheat checks & spoof weapon data
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+    
+    if self == SendData and (method == "FireServer" or method == "fireServer") then
+        local eventName = args[1]
+        if type(eventName) == "string" then
+            -- Block AC detection logs
+            if eventName == "AC Tamper" or eventName == "MemCheck" or eventName == "ZombieBox" or eventName == "ESP" then
+                print("[BYPASS] Blocked Anti-Cheat Check:", eventName)
+                return
+            end
+            
+            -- Spoof weapon stats so the server thinks they are unmodified
+            if eventName:sub(1,1) == "W" then
+                local wIndex = eventName
+                local default = originalStats[wIndex]
+                if not default then
+                    local wp = LocalPlayer.Backpack:FindFirstChild(wIndex) or (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild(wIndex))
+                    if wp then cacheWeapon(wp) end
+                    default = originalStats[wIndex]
+                end
+                if default and type(args[2]) == "table" then
+                    args[2].WeaponName = default.WeaponName
+                    args[2].Ammo = default.Ammo
+                    args[2].StoredAmmo = default.StoredAmmo
+                    args[2].DamageMax = default.DamageMax
+                    args[2].DamageMin = default.DamageMin
+                    args[2].FireTime = default.FireTime
+                end
+                return oldNamecall(self, unpack(args))
+            end
+        end
+    end
+    
+    -- Capture damage key from normal shooting if we missed it
+    if self.Name == "Damage" and (method == "FireServer" or method == "fireServer") then
+        local key = args[2]
+        if key and type(key) == "number" and key >= 0 and key < 1 then
+            damageKey = key
+        end
+    end
+    
+    return oldNamecall(self, ...)
+end))
+
+-- Function to search GC for existing damage key
+local function getDamageKeyFromGC()
+    if not getgc then return end
+    local getinfo = debug.getinfo or getinfo
+    if not getinfo then return end
+    for _, f in ipairs(getgc()) do
+        if type(f) == "function" then
+            local infoOk, info = pcall(getinfo, f)
+            if infoOk and info and info.source and info.source:find("WeaponScript") then
+                for i = 1, 30 do
+                    local ok, name, val = pcall(debug.getupvalue, f, i)
+                    if ok and type(val) == "number" and val >= 0 and val < 1 then
+                        damageKey = val
+                        return val
+                    end
+                end
+            end
+        end
+    end
+end
+getDamageKeyFromGC() -- Try to capture immediately
+
+----------------------------------------------------------------
+-- 2. CORE CHEAT LOGIC & LOOPS
+----------------------------------------------------------------
+
+-- Metatable helper to make Ammo and MagSize 100% read-only and static
+local function makeAmmoStatic(t)
+    local mt = getmetatable(t)
+    if mt and mt.__isStaticAmmo then return end
+    
+    local oldIndex = mt and mt.__index
+    local oldNewIndex = mt and mt.__newindex
+    
+    local newMt = {
+        __isStaticAmmo = true,
+        __index = function(self, key)
+            if key == "Ammo" or key == "MagSize" then
+                if Config.WeaponModsEnabled and Config.InfiniteAmmo then
+                    return 67
+                else
+                    local default = originalStats[rawget(self, "WeaponName")]
+                    return default and default[key] or 8
+                end
+            end
+            if type(oldIndex) == "function" then return oldIndex(self, key)
+            elseif type(oldIndex) == "table" then return oldIndex[key] end
+            return rawget(self, key)
+        end,
+        __newindex = function(self, key, val)
+            if key == "Ammo" or key == "MagSize" then
+                if Config.WeaponModsEnabled and Config.InfiniteAmmo then
+                    -- Ignore write to keep it static
+                    return
+                else
+                    rawset(self, key, val)
+                    return
+                end
+            end
+            if type(oldNewIndex) == "function" then oldNewIndex(self, key, val)
+            elseif type(oldNewIndex) == "table" then oldNewIndex[key] = val
+            else rawset(self, key, val) end
+        end
+    }
+    setmetatable(t, newMt)
+end
+
+-- Apply modifications to a weapon table
+local function modifyWeaponTable(t, default)
+    if not t or not default then return end
+    
+    makeAmmoStatic(t)
+    
+    if Config.WeaponModsEnabled then
+        -- 1. Infinite Ammo (Frozen at 67 to prevent reload loops and keep never-ending status)
+        if Config.InfiniteAmmo then
+            rawset(t, "Ammo", nil)
+            rawset(t, "MagSize", nil)
+            t.StoredAmmo = 9999
+            t.MaxAmmo = 9999
+            t.ReloadTime = 0.02
+        else
+            rawset(t, "Ammo", default.Ammo)
+            rawset(t, "MagSize", default.MagSize)
+            t.StoredAmmo = default.StoredAmmo
+            t.MaxAmmo = default.MaxAmmo
+            t.ReloadTime = default.ReloadTime
+        end
+
+        -- 2. Rapid Fire
+        if Config.RapidFire then
+            t.FireTime = Config.RapidFireVal
+        else
+            t.FireTime = default.FireTime
+        end
+
+        -- 3. Always Auto
+        if Config.AlwaysAuto then
+            t.Semi = false
+        else
+            t.Semi = default.Semi
+        end
+
+        -- 4. No Recoil
+        if Config.NoRecoil then
+            if t.ViewKick then
+                t.ViewKick.Pitch = {Min = 0, Max = 0}
+                t.ViewKick.Yaw = {Min = 0, Max = 0}
+            end
+            t.GunKick = 0
+        else
+            if default.ViewKick and t.ViewKick then
+                t.ViewKick.Pitch = {Min = default.ViewKick.Pitch.Min, Max = default.ViewKick.Pitch.Max}
+                t.ViewKick.Yaw = {Min = default.ViewKick.Yaw.Min, Max = default.ViewKick.Yaw.Max}
+            end
+            t.GunKick = default.GunKick
+        end
+
+        -- 5. No Spread
+        if Config.NoSpread then
+            if t.Spread then
+                t.Spread.Min = 0
+                t.Spread.Max = 0
+                t.Spread.Movement = 0
+            end
+        else
+            if default.Spread and t.Spread then
+                t.Spread.Min = default.Spread.Min
+                t.Spread.Max = default.Spread.Max
+                t.Spread.Movement = default.Spread.Movement
+            end
+        end
+
+        -- 6. Damage Mode
+        if Config.DamageMode == "One-Shot" then
+            t.Damage = {Max = 99999, Min = 99999}
+        elseif Config.DamageMode == "Custom" then
+            t.Damage = {Max = Config.CustomDamageVal, Min = Config.CustomDamageVal}
+        else
+            if t.Damage then
+                t.Damage.Max = default.DamageMax
+                t.Damage.Min = default.DamageMin
+            end
+        end
+
+        -- 7. Instant Reload (Standalone check)
+        if Config.InstantReload then
+            t.ReloadTime = 0.02
+        else
+            if not Config.InfiniteAmmo then
+                t.ReloadTime = default.ReloadTime
+            end
+        end
+
+        -- 8. Infinite Penetration
+        if Config.InfPenetration then
+            t.Penetration = 99
+        else
+            t.Penetration = default.Penetration
+        end
+
+        -- 9. No Sway
+        if Config.NoSway then
+            t.Sway = 0
+        else
+            t.Sway = default.Sway
+        end
+    else
+        -- Restore all defaults
+        t.Ammo = default.Ammo
+        t.StoredAmmo = default.StoredAmmo
+        t.MagSize = default.MagSize
+        t.MaxAmmo = default.MaxAmmo
+        t.FireTime = default.FireTime
+        t.Semi = default.Semi
+        if default.ViewKick and t.ViewKick then
+            t.ViewKick.Pitch = {Min = default.ViewKick.Pitch.Min, Max = default.ViewKick.Pitch.Max}
+            t.ViewKick.Yaw = {Min = default.ViewKick.Yaw.Min, Max = default.ViewKick.Yaw.Max}
+        end
+        t.GunKick = default.GunKick
+        if default.Spread and t.Spread then
+            t.Spread.Min = default.Spread.Min
+            t.Spread.Max = default.Spread.Max
+            t.Spread.Movement = default.Spread.Movement
+        end
+        if t.Damage then
+            t.Damage.Max = default.DamageMax
+            t.Damage.Min = default.DamageMin
+        end
+        t.ReloadTime = default.ReloadTime
+        t.Penetration = default.Penetration
+        t.Sway = default.Sway
+    end
+end
+
+-- GC Scanner to overwrite Weapon Variables dynamically
+local function scanAndModifyGC()
+    if not getgc then return end
+    local getinfo = debug.getinfo or getinfo
+    if not getinfo then return end
+    
+    local tempAmmoUpvalues = {}
+    
+    for _, f in ipairs(getgc()) do
+        if type(f) == "function" then
+            local infoOk, info = pcall(getinfo, f)
+            if infoOk and info and info.source and info.source:find("WeaponScript") then
+                for i = 1, 60 do
+                    local ok, name, val = pcall(debug.getupvalue, f, i)
+                    if not ok or not name then break end
+                    
+                    -- Cache current weapon table pointer
+                    if type(val) == "table" and val.WeaponName and (val.FireTime or val.Semi ~= nil) then
+                        activeWeaponTable = val
+                        local default = originalStats[val.WeaponName]
+                        if default then
+                            modifyWeaponTable(val, default)
+                        end
+                    end
+                    
+                    -- Record active Ammo variable locations to freeze them on render thread
+                    if name == "Ammo" then
+                        table.insert(tempAmmoUpvalues, {func = f, index = i})
+                    elseif name == "MagSize" then
+                        table.insert(tempAmmoUpvalues, {func = f, index = i})
+                    end
+                    
+                    if Config.WeaponModsEnabled then
+                        if name == "FireTime" and Config.RapidFire then
+                            pcall(debug.setupvalue, f, i, Config.RapidFireVal)
+                        elseif name == "Semi" and Config.AlwaysAuto then
+                            pcall(debug.setupvalue, f, i, false)
+                        elseif name == "ReloadTime" and Config.InstantReload then
+                            pcall(debug.setupvalue, f, i, 0.02)
+                        elseif name == "Spread" and Config.NoSpread then
+                            pcall(debug.setupvalue, f, i, {Min = 0, Max = 0, Movement = 0})
+                        elseif name == "Ammo" and Config.InfiniteAmmo then
+                            pcall(debug.setupvalue, f, i, 67)
+                        elseif name == "MagSize" and Config.InfiniteAmmo then
+                            pcall(debug.setupvalue, f, i, 67)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if #tempAmmoUpvalues > 0 then
+        ammoUpvalues = tempAmmoUpvalues
+    end
+end
+
+-- Active Weapon Loop
+local function updateAllWeapons()
+    for _, item in ipairs(LocalPlayer.Backpack:GetChildren()) do
+        if item:IsA("ModuleScript") and item.Name:sub(1,6) == "Weapon" then
+            cacheWeapon(item)
+            local ok, data = pcall(require, item)
+            if ok and data then modifyWeaponTable(data, originalStats[item.Name]) end
+        end
+    end
+    if LocalPlayer.Character then
+        for _, item in ipairs(LocalPlayer.Character:GetChildren()) do
+            if item:IsA("ModuleScript") and item.Name:sub(1,6) == "Weapon" then
+                cacheWeapon(item)
+                local ok, data = pcall(require, item)
+                if ok and data then modifyWeaponTable(data, originalStats[item.Name]) end
+            end
+        end
+    end
+    
+    if _G.Equipped and type(_G.Equipped) == "table" then
+        local default = originalStats[_G.Equipped.WeaponName]
+        if default then modifyWeaponTable(_G.Equipped, default) end
+    end
+    scanAndModifyGC()
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.3)
+        updateAllWeapons()
+    end
+end)
+
+LocalPlayer.Backpack.ChildAdded:Connect(function(child)
+    task.wait(0.2)
+    cacheWeapon(child)
+    updateAllWeapons()
+end)
+
+-- Real-time loops (NoRecoil & Speedhack & Infinite Ammo Locking on RenderStepped)
+local function applyPhysicalMods()
+    if LocalPlayer.Character then
+        -- 1. No Recoil Camera Lock
+        if Config.WeaponModsEnabled and Config.NoRecoil then
+            local RotCam = LocalPlayer.Character:FindFirstChild("RotCam")
+            if RotCam then
+                if RotCam:IsA("Vector3Value") then RotCam.Value = Vector3.new(0, 0, 0)
+                elseif RotCam:IsA("NumberValue") then RotCam.Value = 0
+                elseif RotCam:IsA("CFrameValue") then RotCam.Value = CFrame.new() end
+            end
+        end
+        -- 2. Force WalkSpeed and JumpPower (Every Frame to bypass game loop resets)
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            if Config.SpeedHackEnabled then
+                hum.WalkSpeed = Config.WalkSpeedValue
+            end
+            if Config.JumpHackEnabled then
+                if hum.UseJumpPower then
+                    hum.JumpPower = Config.JumpPowerValue
+                else
+                    hum.JumpHeight = Config.JumpPowerValue / 7.84
+                end
+            end
+        end
+    end
+    
+    -- 3. LOCK AMMO TO STATIC 67 EVERY SINGLE FRAME (Prevents visual flicker and recoil delays)
+    if Config.WeaponModsEnabled and Config.InfiniteAmmo then
+        -- Force active cached weapon tables directly
+        if activeWeaponTable then
+            activeWeaponTable.Ammo = 67
+            activeWeaponTable.MagSize = 67
+        end
+        if _G.Equipped and type(_G.Equipped) == "table" then
+            _G.Equipped.Ammo = 67
+            _G.Equipped.MagSize = 67
+        end
+        -- Force direct local variables of the active shoot closure every frame
+        for _, loc in ipairs(ammoUpvalues) do
+            pcall(debug.setupvalue, loc.func, loc.index, 67)
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(applyPhysicalMods)
+
+-- Infinite Jump
+UserInputService.JumpRequest:Connect(function()
+    if Config.InfJumpEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid"):ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end)
+
+-- Noclip Loop
+local NoclipConnection = nil
+local function toggleNoclip(state)
+    if state then
+        NoclipConnection = RunService.Stepped:Connect(function()
+            if LocalPlayer.Character then
+                for _, part in ipairs(LocalPlayer.Character:GetDescendants()) do
+                    if part:IsA("BasePart") and part.CanCollide then
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end)
+    else
+        if NoclipConnection then
+            NoclipConnection:Disconnect()
+            NoclipConnection = nil
+        end
+    end
+end
+
+-- ESP System
+local function applyESP(zombie)
+    if not Config.EspEnabled then return end
+    
+    local hl = zombie:FindFirstChild("ESPHighlight")
+    if Config.EspBoxes then
+        if not hl then
+            hl = Instance.new("Highlight")
+            hl.Name = "ESPHighlight"
+            hl.FillColor = Config.EspColor
+            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
+            hl.FillTransparency = 0.6
+            hl.OutlineTransparency = 0.1
+            hl.Adornee = zombie
+            hl.Parent = zombie
+        else
+            hl.FillColor = Config.EspColor
+        end
+    else
+        if hl then hl:Destroy() end
+    end
+    
+    local billboard = zombie:FindFirstChild("ESPBillboard")
+    if Config.EspNames or Config.EspDistance or Config.EspHealth then
+        if not billboard then
+            billboard = Instance.new("BillboardGui")
+            billboard.Name = "ESPBillboard"
+            billboard.AlwaysOnTop = true
+            billboard.Size = UDim2.new(0, 200, 0, 50)
+            billboard.ExtentsOffset = Vector3.new(0, 3.5, 0)
+            billboard.Adornee = zombie:FindFirstChild("Head") or zombie:FindFirstChild("Torso") or zombie
+            
+            local container = Instance.new("Frame")
+            container.Size = UDim2.new(1, 0, 1, 0)
+            container.BackgroundTransparency = 1
+            container.Parent = billboard
+            
+            local list = Instance.new("UIListLayout")
+            list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+            list.VerticalAlignment = Enum.VerticalAlignment.Bottom
+            list.Padding = UDim.new(0, 2)
+            list.Parent = container
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Name = "NameLabel"
+            nameLabel.Size = UDim2.new(1, 0, 0, 14)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+            nameLabel.TextStrokeTransparency = 0
+            nameLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextSize = 11
+            nameLabel.Text = zombie.Name
+            nameLabel.Parent = container
+
+            local hpLabel = Instance.new("TextLabel")
+            hpLabel.Name = "HPLabel"
+            hpLabel.Size = UDim2.new(1, 0, 0, 12)
+            hpLabel.BackgroundTransparency = 1
+            hpLabel.TextStrokeTransparency = 0
+            hpLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+            hpLabel.Font = Enum.Font.GothamSemibold
+            hpLabel.TextSize = 10
+            hpLabel.Parent = container
+
+            local distLabel = Instance.new("TextLabel")
+            distLabel.Name = "DistLabel"
+            distLabel.Size = UDim2.new(1, 0, 0, 12)
+            distLabel.BackgroundTransparency = 1
+            distLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+            distLabel.TextStrokeTransparency = 0
+            distLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+            distLabel.Font = Enum.Font.Gotham
+            distLabel.TextSize = 9
+            distLabel.Parent = container
+            
+            billboard.Parent = zombie
+        end
+        
+        local container = billboard:FindFirstChildOfClass("Frame")
+        if container then
+            local nameL = container:FindFirstChild("NameLabel")
+            local hpL = container:FindFirstChild("HPLabel")
+            local distL = container:FindFirstChild("DistLabel")
+            
+            local hum = zombie:FindFirstChildOfClass("Humanoid")
+            local root = zombie:FindFirstChild("HumanoidRootPart") or zombie:FindFirstChild("Torso")
+            
+            if nameL then nameL.Visible = Config.EspNames end
+            
+            if hpL and hum then
+                hpL.Visible = Config.EspHealth
+                hpL.Text = math.floor(hum.Health) .. " / " .. math.floor(hum.MaxHealth) .. " HP"
+                local pct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                hpL.TextColor3 = Color3.fromHSV(pct * 0.33, 1, 1)
+            end
+            
+            if distL and root and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+                distL.Visible = Config.EspDistance
+                local dist = math.floor((LocalPlayer.Character.HumanoidRootPart.Position - root.Position).Magnitude)
+                distL.Text = dist .. " studs"
+            end
+        end
+    else
+        if billboard then billboard:Destroy() end
+    end
+end
+
+local function removeESP(zombie)
+    local hl = zombie:FindFirstChild("ESPHighlight")
+    if hl then hl:Destroy() end
+    local billboard = zombie:FindFirstChild("ESPBillboard")
+    if billboard then billboard:Destroy() end
+end
+
+local function updateESPState()
+    local Baddies = workspace:FindFirstChild("Baddies")
+    if not Baddies then return end
+    for _, z in ipairs(Baddies:GetChildren()) do
+        if Config.EspEnabled then applyESP(z) else removeESP(z) end
+    end
+end
+
+workspace:WaitForChild("Baddies").ChildAdded:Connect(function(child)
+    task.wait(0.1)
+    if Config.EspEnabled then applyESP(child) end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if Config.EspEnabled then
+            local Baddies = workspace:FindFirstChild("Baddies")
+            if Baddies then
+                for _, z in ipairs(Baddies:GetChildren()) do applyESP(z) end
+            end
+        end
+    end
+end)
+
+-- Kill All Function
+local function killAllZombies()
+    if not damageKey then getDamageKeyFromGC() end
+    if not damageKey then return false, "No damage key captured yet." end
+    
+    local Baddies = workspace:FindFirstChild("Baddies")
+    if not Baddies then return false, "No zombies container!" end
+    
+    local count = 0
+    for _, z in ipairs(Baddies:GetChildren()) do
+        local hum = z:FindFirstChildOfClass("Humanoid")
+        local head = z:FindFirstChild("Head") or z:FindFirstChild("Torso")
+        if hum and head and hum.Health > 0 then
+            local damageEvent = hum:FindFirstChild("Damage")
+            if damageEvent then
+                pcall(function()
+                    damageEvent:FireServer({
+                        Damage = hum.MaxHealth + 1000,
+                        BodyPart = head,
+                        GibPower = 3,
+                        Force = 15,
+                        Source = head.Position,
+                        WeaponName = "Beretta M9"
+                    }, damageKey)
+                    count = count + 1
+                end)
+            end
+        end
+    end
+    return true, "Killed " .. count .. " zombies!"
+end
+
+task.spawn(function()
+    while true do
+        if Config.KillAllActive then killAllZombies() end
+        task.wait(Config.AutoKillDelay)
+    end
+end)
+
+-- Dragging functionality helper (Defined first to avoid attempt to call a nil value)
+local function makeDraggable(frame, parentFrame)
+    local dragging, dragInput, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = parentFrame.Position
+            
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    frame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            parentFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- MOBILE UI CREATION
+----------------------------------------------------------------
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "LazarusHubV3"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = game.CoreGui
+
+-- Toast Notification Helper
+local function showToast(text, duration)
+    duration = duration or 2
+    local toast = Instance.new("Frame")
+    toast.Size = UDim2.new(0, 260, 0, 45)
+    toast.Position = UDim2.new(1, -280, 1, 50)
+    toast.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    toast.BorderSizePixel = 0
+    toast.ZIndex = 10
+    toast.Parent = ScreenGui
+    
+    local toastCorner = Instance.new("UICorner")
+    toastCorner.CornerRadius = UDim.new(0, 6)
+    toastCorner.Parent = toast
+    
+    local toastStroke = Instance.new("UIStroke")
+    toastStroke.Color = Config.EspColor
+    toastStroke.Thickness = 1.5
+    toastStroke.Parent = toast
+    
+    local toastLabel = Instance.new("TextLabel")
+    toastLabel.Size = UDim2.new(1, -20, 1, 0)
+    toastLabel.Position = UDim2.new(0, 10, 0, 0)
+    toastLabel.BackgroundTransparency = 1
+    toastLabel.Text = text
+    toastLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toastLabel.Font = Enum.Font.GothamSemibold
+    toastLabel.TextSize = 12
+    toastLabel.TextWrapped = true
+    toastLabel.ZIndex = 10
+    toastLabel.Parent = toast
+    
+    task.spawn(function()
+        task.wait(0.05)
+        pcall(function()
+            TweenService:Create(toast, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+                Position = UDim2.new(1, -280, 1, -65)
+            }):Play()
+        end)
+        
+        task.wait(duration)
+        
+        pcall(function()
+            local tween = TweenService:Create(toast, TweenInfo.new(0.4, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+                Position = UDim2.new(1, -280, 1, 50)
+            })
+            tween.Completed:Connect(function() toast:Destroy() end)
+            tween:Play()
+        end)
+    end)
+end
+
+-- Main Frame
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0.94, 0, 0.82, 0)
+MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+local mainSizeConstraint = Instance.new("UISizeConstraint")
+mainSizeConstraint.MinSize = Vector2.new(310, 330)
+mainSizeConstraint.MaxSize = Vector2.new(560, 420)
+mainSizeConstraint.Parent = MainFrame
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.Parent = ScreenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 12)
+mainCorner.Parent = MainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Config.EspColor
+mainStroke.Thickness = 1.5
+mainStroke.Parent = MainFrame
+
+-- Header
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, 45)
+Header.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+Header.BorderSizePixel = 0
+Header.Parent = MainFrame
+makeDraggable(Header, MainFrame)
+
+local headerCorner = Instance.new("UICorner")
+headerCorner.CornerRadius = UDim.new(0, 12)
+headerCorner.Parent = Header
+
+local headerBlend = Instance.new("Frame")
+headerBlend.Size = UDim2.new(1, 0, 0, 15)
+headerBlend.Position = UDim2.new(0, 0, 1, -15)
+headerBlend.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+headerBlend.BorderSizePixel = 0
+headerBlend.Parent = Header
+
+local Title = Instance.new("TextLabel")
+Title.Size = UDim2.new(1, -55, 1, 0)
+Title.Position = UDim2.new(0, 15, 0, 0)
+Title.BackgroundTransparency = 1
+Title.Text = "PROJECT LAZARUS HUB â V3.5"
+Title.TextColor3 = Color3.fromRGB(255, 255, 255)
+Title.Font = Enum.Font.GothamBold
+Title.TextSize = 12
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
+
+local Subtitle = Instance.new("TextLabel")
+Subtitle.Size = UDim2.new(0, 1, 0, 1)
+Subtitle.Position = UDim2.new(0, 0, 0, 0)
+Subtitle.BackgroundTransparency = 1
+Subtitle.Text = "Tap the floating icon to open/close"
+Subtitle.TextColor3 = Config.EspColor
+Subtitle.Font = Enum.Font.GothamSemibold
+Subtitle.TextSize = 11
+Subtitle.TextXAlignment = Enum.TextXAlignment.Right
+Subtitle.Parent = Header
+
+-- Close Button
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 30, 0, 30)
+CloseBtn.Position = UDim2.new(1, -40, 0.5, -15)
+CloseBtn.BackgroundTransparency = 1
+CloseBtn.Text = "â"
+CloseBtn.TextColor3 = Color3.fromRGB(150, 150, 150)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 16
+CloseBtn.Parent = Header
+
+CloseBtn.MouseButton1Click:Connect(function()
+    toggleNoclip(false)
+    local baddies = workspace:FindFirstChild("Baddies")
+    if baddies then
+        for _, zombie in ipairs(baddies:GetChildren()) do
+            removeESP(zombie)
+        end
+    end
+    ScreenGui:Destroy()
+    _G.LazarusHubLoaded = nil
+end)
+CloseBtn.MouseEnter:Connect(function() CloseBtn.TextColor3 = Color3.fromRGB(255, 70, 70) end)
+CloseBtn.MouseLeave:Connect(function() CloseBtn.TextColor3 = Color3.fromRGB(150, 150, 150) end)
+
+-- Floating mobile button: always available while the menu is hidden.
+local MobileToggle = Instance.new("TextButton")
+MobileToggle.Name = "MobileMenuToggle"
+MobileToggle.Size = UDim2.new(0, 54, 0, 54)
+MobileToggle.Position = UDim2.new(1, -72, 0.55, -27)
+MobileToggle.AnchorPoint = Vector2.new(0, 0)
+MobileToggle.BackgroundColor3 = Color3.fromRGB(0, 130, 200)
+MobileToggle.Text = "PL"
+MobileToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+MobileToggle.Font = Enum.Font.GothamBold
+MobileToggle.TextSize = 16
+MobileToggle.AutoButtonColor = true
+MobileToggle.Active = true
+MobileToggle.ZIndex = 20
+MobileToggle.Parent = ScreenGui
+local mobileToggleCorner = Instance.new("UICorner")
+mobileToggleCorner.CornerRadius = UDim.new(1, 0)
+mobileToggleCorner.Parent = MobileToggle
+local mobileToggleStroke = Instance.new("UIStroke")
+mobileToggleStroke.Color = Config.EspColor
+mobileToggleStroke.Thickness = 2
+mobileToggleStroke.Parent = MobileToggle
+MobileToggle.Activated:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+    MobileToggle.Text = MainFrame.Visible and "Ã" or "PL"
+end)
+
+
+
+-- Sidebar (Left side navigation)
+local Sidebar = Instance.new("Frame")
+Sidebar.Size = UDim2.new(0, 100, 1, -45)
+Sidebar.Position = UDim2.new(0, 0, 0, 45)
+Sidebar.BackgroundColor3 = Color3.fromRGB(12, 12, 17)
+Sidebar.BorderSizePixel = 0
+Sidebar.Parent = MainFrame
+
+local sidebarCorner = Instance.new("UICorner")
+sidebarCorner.CornerRadius = UDim.new(0, 12)
+sidebarCorner.Parent = Sidebar
+
+local sidebarBlend = Instance.new("Frame")
+sidebarBlend.Size = UDim2.new(0, 10, 1, -45)
+sidebarBlend.Position = UDim2.new(0, 90, 0, 45)
+sidebarBlend.BackgroundColor3 = Color3.fromRGB(12, 12, 17)
+sidebarBlend.BorderSizePixel = 0
+sidebarBlend.Parent = MainFrame
+
+local tabList = Instance.new("UIListLayout")
+tabList.Padding = UDim.new(0, 5)
+tabList.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabList.Parent = Sidebar
+
+-- Tab Containers (Right side container)
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, -115, 1, -60)
+Container.Position = UDim2.new(0, 108, 0, 55)
+Container.BackgroundTransparency = 1
+Container.Parent = MainFrame
+
+local pages = {}
+local activePage = nil
+local activeTabBtn = nil
+
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 4
+    page.ScrollBarImageColor3 = Config.EspColor
+    page.Visible = false
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.Parent = Container
+    
+    local list = Instance.new("UIListLayout")
+    list.Padding = UDim.new(0, 8)
+    list.Parent = page
+    
+    pages[name] = page
+    return page
+end
+
+-- Helper to switch pages
+local function selectTab(name, btn)
+    if activePage then activePage.Visible = false end
+    if activeTabBtn then
+        TweenService:Create(activeTabBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = Color3.fromRGB(22, 22, 30),
+            TextColor3 = Color3.fromRGB(150, 150, 150)
+        }):Play()
+    end
+    
+    activePage = pages[name]
+    activePage.Visible = true
+    activeTabBtn = btn
+    TweenService:Create(btn, TweenInfo.new(0.2), {
+        BackgroundColor3 = Color3.fromRGB(0, 130, 200),
+        TextColor3 = Color3.fromRGB(255, 255, 255)
+    }):Play()
+end
+
+-- Create Tab Button
+local function createTabButton(name)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -10, 0, 42)
+    btn.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    btn.BorderSizePixel = 0
+    btn.Text = name
+    btn.TextColor3 = Color3.fromRGB(150, 150, 150)
+    btn.Font = Enum.Font.GothamSemibold
+    btn.TextSize = 12
+    btn.Parent = Sidebar
+    
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 6)
+    btnCorner.Parent = btn
+    
+    btn.MouseButton1Click:Connect(function()
+        selectTab(name, btn)
+    end)
+    
+    return btn
+end
+
+-- Initialize Pages
+local combatPage = createPage("Combat")
+local weaponPage = createPage("Weapons")
+local visualsPage = createPage("Visuals")
+local playerPage = createPage("Player")
+
+local combatBtn = createTabButton("Combat")
+local weaponBtn = createTabButton("Weapons")
+local visualsBtn = createTabButton("Visuals")
+local playerBtn = createTabButton("Player")
+
+-- Add spacer
+local spacer = Instance.new("Frame")
+spacer.Size = UDim2.new(0, 10, 0, 5)
+spacer.BackgroundTransparency = 1
+spacer.Parent = Sidebar
+spacer.LayoutOrder = -1
+
+selectTab("Combat", combatBtn)
+
+----------------------------------------------------------------
+-- UI ELEMENT HELPERS WITH TWEENS & INTERACTIVE KEYBINDS
+----------------------------------------------------------------
+
+-- Helper: Create Toggle Row with Bindable Keyboard Key
+local function createToggleRow(parentPage, labelText, defaultVal, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -10, 0, 45)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    row.BorderSizePixel = 0
+    row.Parent = parentPage
+    
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 6)
+    rowCorner.Parent = row
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -145, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0, 62, 0, 30)
+    toggleBtn.Position = UDim2.new(1, -72, 0.5, -15)
+    toggleBtn.BackgroundColor3 = defaultVal and Color3.fromRGB(0, 180, 255) or Color3.fromRGB(40, 40, 50)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Text = defaultVal and "ON" or "OFF"
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.TextSize = 11
+    toggleBtn.Parent = row
+    
+    local toggleCorner = Instance.new("UICorner")
+    toggleCorner.CornerRadius = UDim.new(0, 4)
+    toggleCorner.Parent = toggleBtn
+    
+    local state = defaultVal
+    local function updateVisuals()
+        local targetColor = state and Color3.fromRGB(0, 180, 255) or Color3.fromRGB(40, 40, 50)
+        TweenService:Create(toggleBtn, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
+        toggleBtn.Text = state and "ON" or "OFF"
+    end
+    
+    local function toggle()
+        state = not state
+        updateVisuals()
+        callback(state)
+    end
+    
+    toggleBtn.MouseButton1Click:Connect(toggle)
+    
+    row.MouseEnter:Connect(function()
+        TweenService:Create(row, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(28, 28, 38)}):Play()
+    end)
+    row.MouseLeave:Connect(function()
+        TweenService:Create(row, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(22, 22, 30)}):Play()
+    end)
+    
+    return {
+        toggle = toggle,
+        setState = function(newState)
+            state = newState
+            updateVisuals()
+            callback(state)
+        end,
+        getState = function() return state end
+    }
+end
+
+-- Helper: Create Button Row with dynamic Keybinds
+local function createButtonRow(parentPage, labelText, btnText, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -10, 0, 45)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    row.BorderSizePixel = 0
+    row.Parent = parentPage
+    
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 6)
+    rowCorner.Parent = row
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -145, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+    
+    local actionBtn = Instance.new("TextButton")
+    actionBtn.Size = UDim2.new(0, 82, 0, 30)
+    actionBtn.Position = UDim2.new(1, -92, 0.5, -15)
+    actionBtn.BackgroundColor3 = Color3.fromRGB(0, 130, 200)
+    actionBtn.BorderSizePixel = 0
+    actionBtn.Text = btnText
+    actionBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    actionBtn.Font = Enum.Font.GothamBold
+    actionBtn.TextSize = 11
+    actionBtn.Parent = row
+    
+    local actCorner = Instance.new("UICorner")
+    actCorner.CornerRadius = UDim.new(0, 4)
+    actCorner.Parent = actionBtn
+    
+    actionBtn.MouseButton1Click:Connect(callback)
+    
+    actionBtn.MouseEnter:Connect(function() 
+        TweenService:Create(actionBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(0, 150, 230)}):Play()
+    end)
+    actionBtn.MouseLeave:Connect(function() 
+        TweenService:Create(actionBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(0, 130, 200)}):Play()
+    end)
+end
+
+-- Helper: Create Slider Row
+local function createSliderRow(parentPage, labelText, min, max, defaultVal, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -10, 0, 55)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    row.BorderSizePixel = 0
+    row.Parent = parentPage
+    
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 6)
+    rowCorner.Parent = row
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 0, 25)
+    label.Position = UDim2.new(0, 12, 0, 2)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+    
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.Size = UDim2.new(0.4, 0, 0, 25)
+    valueLabel.Position = UDim2.new(0.6, -12, 0, 2)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = tostring(defaultVal)
+    valueLabel.TextColor3 = Color3.fromRGB(0, 180, 255)
+    valueLabel.Font = Enum.Font.GothamBold
+    valueLabel.TextSize = 13
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Parent = row
+    
+    local sliderBg = Instance.new("Frame")
+    sliderBg.Size = UDim2.new(1, -24, 0, 6)
+    sliderBg.Position = UDim2.new(0, 12, 0, 36)
+    sliderBg.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    sliderBg.BorderSizePixel = 0
+    sliderBg.Parent = row
+    
+    local sliderBgCorner = Instance.new("UICorner")
+    sliderBgCorner.CornerRadius = UDim.new(0, 3)
+    sliderBgCorner.Parent = sliderBg
+    
+    local sliderFill = Instance.new("Frame")
+    sliderFill.Size = UDim2.new((defaultVal - min) / (max - min), 0, 1, 0)
+    sliderFill.BackgroundColor3 = Color3.fromRGB(0, 180, 255)
+    sliderFill.BorderSizePixel = 0
+    sliderFill.Parent = sliderBg
+    
+    local sliderFillCorner = Instance.new("UICorner")
+    sliderFillCorner.CornerRadius = UDim.new(0, 3)
+    sliderFillCorner.Parent = sliderFill
+    
+    local sliderBtn = Instance.new("ImageButton")
+    sliderBtn.Size = UDim2.new(0, 14, 0, 14)
+    sliderBtn.Position = UDim2.new((defaultVal - min) / (max - min), -7, 0.5, -7)
+    sliderBtn.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    sliderBtn.BorderSizePixel = 0
+    sliderBtn.Parent = sliderBg
+    
+    local sliderBtnCorner = Instance.new("UICorner")
+    sliderBtnCorner.CornerRadius = UDim.new(0, 7)
+    sliderBtnCorner.Parent = sliderBtn
+    
+    local active = false
+    local function updateSlider(input)
+        local posX = math.clamp((input.Position.X - sliderBg.AbsolutePosition.X) / sliderBg.AbsoluteSize.X, 0, 1)
+        sliderFill.Size = UDim2.new(posX, 0, 1, 0)
+        sliderBtn.Position = UDim2.new(posX, -7, 0.5, -7)
+        
+        local val = min + (max - min) * posX
+        if max - min > 10 then
+            val = math.floor(val)
+        else
+            val = tonumber(string.format("%.3f", val))
+        end
+        valueLabel.Text = tostring(val)
+        callback(val)
+    end
+    
+    sliderBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            active = true
+        end
+    end)
+    
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            active = false
+        end
+    end)
+    
+    UserInputService.InputChanged:Connect(function(input)
+        if active and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            updateSlider(input)
+        end
+    end)
+end
+
+-- Helper: Create Choice Selector (Dropdown replacement)
+local function createDropdownRow(parentPage, labelText, options, defaultOption, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -10, 0, 45)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    row.BorderSizePixel = 0
+    row.Parent = parentPage
+    
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 6)
+    rowCorner.Parent = row
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    local dropdownBtn = Instance.new("TextButton")
+    dropdownBtn.Size = UDim2.new(0, 120, 0, 25)
+    dropdownBtn.Position = UDim2.new(1, -132, 0.5, -12)
+    dropdownBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+    dropdownBtn.BorderSizePixel = 0
+    dropdownBtn.Text = defaultOption
+    dropdownBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    dropdownBtn.Font = Enum.Font.GothamBold
+    dropdownBtn.TextSize = 11
+    dropdownBtn.Parent = row
+
+    local dropCorner = Instance.new("UICorner")
+    dropCorner.CornerRadius = UDim.new(0, 4)
+    dropCorner.Parent = dropdownBtn
+
+    local currentIndex = table.find(options, defaultOption) or 1
+    
+    dropdownBtn.MouseButton1Click:Connect(function()
+        currentIndex = currentIndex + 1
+        if currentIndex > #options then currentIndex = 1 end
+        local selected = options[currentIndex]
+        dropdownBtn.Text = selected
+        callback(selected)
+    end)
+end
+
+-- Helper: Create Color Picker Circle row
+local function createColorPickerRow(parentPage, labelText, defaultColor, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -10, 0, 45)
+    row.BackgroundColor3 = Color3.fromRGB(22, 22, 30)
+    row.BorderSizePixel = 0
+    row.Parent = parentPage
+    
+    local rowCorner = Instance.new("UICorner")
+    rowCorner.CornerRadius = UDim.new(0, 6)
+    rowCorner.Parent = row
+    
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.4, 0, 1, 0)
+    label.Position = UDim2.new(0, 12, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamSemibold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    local colorContainer = Instance.new("Frame")
+    colorContainer.Size = UDim2.new(0.6, -12, 1, 0)
+    colorContainer.Position = UDim2.new(0.4, 0, 0, 0)
+    colorContainer.BackgroundTransparency = 1
+    colorContainer.Parent = row
+    
+    local list = Instance.new("UIListLayout")
+    list.FillDirection = Enum.FillDirection.Horizontal
+    list.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    list.VerticalAlignment = Enum.VerticalAlignment.Center
+    list.Padding = UDim.new(0, 8)
+    list.Parent = colorContainer
+
+    local colors = {
+        Red = Color3.fromRGB(255, 60, 60),
+        Green = Color3.fromRGB(0, 255, 100),
+        Blue = Color3.fromRGB(0, 180, 255),
+        Yellow = Color3.fromRGB(255, 220, 0),
+        Purple = Color3.fromRGB(190, 80, 255),
+        White = Color3.fromRGB(255, 255, 255)
+    }
+
+    for name, color in pairs(colors) do
+        local colorBtn = Instance.new("ImageButton")
+        colorBtn.Size = UDim2.new(0, 18, 0, 18)
+        colorBtn.BackgroundColor3 = color
+        colorBtn.BorderSizePixel = 0
+        colorBtn.Parent = colorContainer
+        
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(1, 0)
+        corner.Parent = colorBtn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 1.5
+        stroke.Color = (color == defaultColor) and Color3.fromRGB(255, 255, 255) or Color3.fromRGB(0, 0, 0)
+        stroke.Parent = colorBtn
+
+        colorBtn.MouseButton1Click:Connect(function()
+            for _, btn in ipairs(colorContainer:GetChildren()) do
+                if btn:IsA("ImageButton") then
+                    btn:FindFirstChildOfClass("UIStroke").Color = Color3.fromRGB(0, 0, 0)
+                end
+            end
+            stroke.Color = Color3.fromRGB(255, 255, 255)
+            callback(color)
+        end)
+    end
+end
+
+----------------------------------------------------------------
+-- 5. POPULATE TAB PAGES
+----------------------------------------------------------------
+
+-- COMBAT PAGE
+local loopKillRow = createToggleRow(combatPage, "Loop Kill All Zombies", Config.KillAllActive, function(state)
+    Config.KillAllActive = state
+    showToast("[COMBAT] Loop Kill All " .. (state and "Enabled" or "Disabled"))
+end)
+
+createSliderRow(combatPage, "Auto Kill Delay (Secs)", 0.05, 1.5, Config.AutoKillDelay, function(val)
+    Config.AutoKillDelay = val
+end)
+
+createButtonRow(combatPage, "Instant Kill All Zombies", "Kill All", function()
+    local ok, res = killAllZombies()
+    showToast("[COMBAT] " .. res)
+end)
+
+
+-- WEAPONS PAGE
+local weaponModsRow = createToggleRow(weaponPage, "Enable Weapon Mods", Config.WeaponModsEnabled, function(state)
+    Config.WeaponModsEnabled = state
+    updateAllWeapons()
+    showToast("[WEAPONS] Weapon Mods " .. (state and "Activated" or "Restored to normal"))
+end)
+
+createToggleRow(weaponPage, "Infinite Clip & Ammo", Config.InfiniteAmmo, function(state)
+    Config.InfiniteAmmo = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "Rapid Fire (Custom rate)", Config.RapidFire, function(state)
+    Config.RapidFire = state
+    updateAllWeapons()
+end)
+
+createSliderRow(weaponPage, "Rapid Fire Rate", 0.01, 0.25, Config.RapidFireVal, function(val)
+    Config.RapidFireVal = val
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "Force Always Automatic", Config.AlwaysAuto, function(state)
+    Config.AlwaysAuto = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "No Weapon Recoil", Config.NoRecoil, function(state)
+    Config.NoRecoil = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "No Weapon Spread", Config.NoSpread, function(state)
+    Config.NoSpread = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "No Scope Sway", Config.NoSway, function(state)
+    Config.NoSway = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "Instant Reload", Config.InstantReload, function(state)
+    Config.InstantReload = state
+    updateAllWeapons()
+end)
+
+createToggleRow(weaponPage, "Infinite Penetration", Config.InfPenetration, function(state)
+    Config.InfPenetration = state
+    updateAllWeapons()
+end)
+
+createDropdownRow(weaponPage, "Damage Preset Mod", {"Normal", "Custom", "One-Shot"}, Config.DamageMode, function(choice)
+    Config.DamageMode = choice
+    updateAllWeapons()
+    showToast("[WEAPONS] Damage mode: " .. choice)
+end)
+
+createSliderRow(weaponPage, "Custom Damage Value", 20, 1000, Config.CustomDamageVal, function(val)
+    Config.CustomDamageVal = val
+    if Config.DamageMode == "Custom" then
+        updateAllWeapons()
+    end
+end)
+
+
+-- VISUALS PAGE
+local espRow = createToggleRow(visualsPage, "Zombie ESP (Master Switch)", Config.EspEnabled, function(state)
+    Config.EspEnabled = state
+    updateESPState()
+    showToast("[VISUALS] Zombie ESP " .. (state and "ON" or "OFF"))
+end)
+
+createToggleRow(visualsPage, "ESP Show Outlines / Box", Config.EspBoxes, function(state)
+    Config.EspBoxes = state
+    updateESPState()
+end)
+
+createToggleRow(visualsPage, "ESP Show Names", Config.EspNames, function(state)
+    Config.EspNames = state
+    updateESPState()
+end)
+
+createToggleRow(visualsPage, "ESP Show Health Stats", Config.EspHealth, function(state)
+    Config.EspHealth = state
+    updateESPState()
+end)
+
+createToggleRow(visualsPage, "ESP Show Distance", Config.EspDistance, function(state)
+    Config.EspDistance = state
+    updateESPState()
+end)
+
+createColorPickerRow(visualsPage, "ESP Custom Color Theme", Config.EspColor, function(color)
+    Config.EspColor = color
+    mainStroke.Color = color
+    mobileToggleStroke.Color = color
+    MobileToggle.BackgroundColor3 = color
+    Subtitle.TextColor3 = color
+    updateESPState()
+end)
+
+
+-- PLAYER PAGE
+local speedRow = createToggleRow(playerPage, "Speed Hack", Config.SpeedHackEnabled, function(state)
+    Config.SpeedHackEnabled = state
+    if not state and LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = 16
+    end
+    showToast("[PLAYER] Speed Hack " .. (state and "ON" or "OFF"))
+end)
+
+createSliderRow(playerPage, "WalkSpeed Limit", 16, 150, Config.WalkSpeedValue, function(val)
+    Config.WalkSpeedValue = val
+end)
+
+local jumpRow = createToggleRow(playerPage, "Jump Hack", Config.JumpHackEnabled, function(state)
+    Config.JumpHackEnabled = state
+    if not state and LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid") then
+        local hum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum.UseJumpPower then
+            hum.JumpPower = 50
+        else
+            hum.JumpHeight = 7.2
+        end
+    end
+    showToast("[PLAYER] Jump Hack " .. (state and "ON" or "OFF"))
+end)
+
+createSliderRow(playerPage, "JumpPower Limit", 50, 250, Config.JumpPowerValue, function(val)
+    Config.JumpPowerValue = val
+end)
+
+local infJumpRow = createToggleRow(playerPage, "Infinite Jump", Config.InfJumpEnabled, function(state)
+    Config.InfJumpEnabled = state
+    showToast("[PLAYER] Infinite Jump " .. (state and "Enabled" or "Disabled"))
+end)
+
+local noclipRow = createToggleRow(playerPage, "Noclip (Wall Hack)", Config.NoclipEnabled, function(state)
+    Config.NoclipEnabled = state
+    toggleNoclip(state)
+    showToast("[PLAYER] Noclip " .. (state and "Enabled" or "Disabled"))
+end)
+
+showToast("[HUB] Mobile UI loaded.", 4)
+print("[HUB] Lazarus Mobile Hub loaded.")
